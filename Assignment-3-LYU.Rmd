@@ -1,0 +1,956 @@
+---
+title: "Assignment 3"
+output: html_document
+date: '2022-07-24'
+---
+# Explanation
+#### Written with Rmarkdown. The results and graphs are hidden, only the code is shown.
+#### I've done DiD regressions on multiple time periods before with stata, using simple covariates on time and individuals. I was shocked at the level of sophistication of this R package.
+
+#### Whether it works or not, I upgraded R. If we install the did package directly it will report an error, we need to install the "DRDID" package first.
+#### In the "Using the Callaway and Sant'Anna (202) framework"section, the code "ata_CS_never <- map_dfr(1:nrep, run_CS_never)" reports an error, and I really don't know how to handle it, so I have to choose to skip all the relevant parts.
+
+#### What's worse is that,even though the developer has indicated that functions related to simulated data have already been  available in https://github.com/bcallaway11/did/issues/44, I was unable to generate simulated data successfully in all places involving" build_sim_dataset()" or" reset.sim()".
+#### Even if I refer to the original vignettes.Rmd on github and generate simulated data, it doesn't match with the developer's result even in rows.
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+```{r gh-installation, eval = FALSE}
+devtools::install_github("pedrohcgs/DRDID")
+devtools::install_github("bcallaway11/did")
+```
+```{r message=FALSE,results='hide',fig.show='hide'}
+options(repos = list(CRAN="http://cran.rstudio.com/"))
+install.packages("tidyverse")
+install.packages("lfe")
+install.packages("fastDummies")
+install.packages("ggthemes")
+```
+```{r message=FALSE,results='hide',fig.show='hide'}
+library(tidyverse)
+library(lfe)
+library(fastDummies)
+library(ggthemes)
+library(did)
+library(DRDID)
+theme_set(theme_clean() + theme(plot.background = element_blank()))
+iseed  = 20201221
+nrep <- 100  
+true_mu <- 1
+set.seed(iseed)
+```
+# Getting Started with the did Package
+#### Examples with simulated data
+Estimating Group-Time Average Treatment Effects
+```{r message=FALSE,results='hide',fig.show='hide'}
+set.seed(1814)
+time.periods <- 4
+sp <- reset.sim()
+sp$te <- 0
+sp$te.e <- 1:time.periods
+dta <- build_sim_dataset(sp)
+nrow(dta)
+head(dta)
+```
+```{r message=FALSE,results='hide',fig.show='hide'}
+example_attgt <- att_gt(yname = "Y",
+                        tname = "period",
+                        idname = "id",
+                        gname = "G",
+                        xformla = ~X,
+                        data = dta
+                        )
+summary(example_attgt)
+ggdid(example_attgt)
+```
+Other features of the did package
+```{r message=FALSE,results='hide',fig.show='hide'}
+agg.simple <- aggte(example_attgt, type = "simple")
+summary(agg.simple)
+agg.es <- aggte(example_attgt, type = "dynamic")
+summary(agg.es)
+ggdid(agg.es)
+
+agg.gs <- aggte(example_attgt, type = "group")
+summary(agg.gs)
+ggdid(agg.gs)
+
+agg.ct <- aggte(example_attgt, type = "calendar")
+summary(agg.ct)
+ggdid(agg.ct)
+```
+```{r message=FALSE,results='hide',fig.show='hide'}
+example_attgt_altcontrol <- att_gt(yname = "Y",
+                                   tname = "period",
+                                   idname = "id",
+                                   gname = "G",
+                                   xformla = ~X,
+                                   data = dta,
+                                   control_group = "notyettreated"          
+                                   )
+summary(example_attgt_altcontrol)
+```
+
+
+#### An example with real data
+```{r message=FALSE,results='hide',fig.show='hide'}
+library(did)
+data(mpdta)
+head(mpdta)
+mw.attgt <- att_gt(yname = "lemp",
+                   gname = "first.treat",
+                   idname = "countyreal",
+                   tname = "year",
+                   xformla = ~1,
+                   data = mpdta,
+                   )
+summary(mw.attgt)
+ggdid(mw.attgt, ylim = c(-.3,.3))
+
+mw.dyn <- aggte(mw.attgt, type = "dynamic")
+summary(mw.dyn)
+ggdid(mw.dyn, ylim = c(-.3,.3))
+
+mw.dyn.balance <- aggte(mw.attgt, type = "dynamic", balance_e=1)
+summary(mw.dyn.balance)
+ggdid(mw.dyn.balance, ylim = c(-.3,.3))
+
+mw.attgt.X <- att_gt(yname = "lemp",
+                   gname = "first.treat",
+                   idname = "countyreal",
+                   tname = "year",
+                   xformla = ~lpop,
+                   data = mpdta,
+                   )
+```
+
+# Problems with two-way fixed-effects event-study regressions
+
+#### Setup with all units being eventually treated and homogeneous treatment effect dynamics
+Visualizing the DGP
+
+```{r message=FALSE,results='hide',fig.show='hide'}
+make_data <- function(nobs = 1000, 
+                      nstates = 40) { 
+  unit <- tibble(
+    unit = 1:nobs,
+    state = sample(1:nstates, nobs, replace = TRUE),
+    unit_fe = rnorm(nobs, state/5, 1),
+    mu = true_mu
+    )
+year <- tibble(
+    year = 1980:2010,
+    year_fe = rnorm(length(year), 0, 1)
+  )
+  treat_taus <- tibble(
+    state = sample(1:nstates, nstates, replace = FALSE),
+    cohort_year = sort(rep(c(1986, 1992, 1998, 2004), 10))
+  )  
+  expand_grid(unit = 1:nobs, year = 1980:2010) %>% 
+    left_join(., unit) %>% 
+    left_join(., year) %>% 
+    left_join(., treat_taus) %>% 
+    mutate(error = rnorm(nobs*31, 0, 1),
+           treat = ifelse(year >= cohort_year, 1, 0),
+           tau = ifelse(treat == 1, mu, 0),
+           year_fe = year_fe + 0.1*(year - cohort_year)
+    ) %>% 
+    group_by(unit) %>% 
+    mutate(tau_cum = cumsum(tau)) %>% 
+    ungroup() %>% 
+    mutate(dep_var = (2010 - cohort_year) + unit_fe + year_fe + tau_cum + error)
+}
+data <- make_data()
+plot1 <- data %>% 
+  ggplot(aes(x = year, y = dep_var, group = unit)) + 
+  geom_line(alpha = 1/8, color = "grey") + 
+  geom_line(data = data %>% 
+              group_by(cohort_year, year) %>% 
+              summarize(dep_var = mean(dep_var)),
+            aes(x = year, y = dep_var, group = factor(cohort_year),
+                color = factor(cohort_year)),
+            size = 2) + 
+  labs(x = "", y = "Value", color = "Treatment group   ") + 
+  geom_vline(xintercept = 1986, color = '#E41A1C', size = 2) + 
+  geom_vline(xintercept = 1992, color = '#377EB8', size = 2) + 
+  geom_vline(xintercept = 1998, color = '#4DAF4A', size = 2) + 
+  geom_vline(xintercept = 2004, color = '#984EA3', size = 2) + 
+  scale_color_brewer(palette = 'Set1') + 
+  theme(legend.position = 'bottom',
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))  +
+  ggtitle("One draw of the DGP with homogeneous effects across cohorts \n and with all groups being eventually treated")+
+  theme(plot.title = element_text(hjust = 0.5, size=12))
+
+plot1
+```
+Estimating dynamic treatment effects via TWFE event-study regressions
+```{r message=FALSE,results='hide',fig.show='hide'}
+keepvars <- c("`rel_year_-5`",  "`rel_year_-4`",  "`rel_year_-3`",  "`rel_year_-2`",
+              "rel_year_0", "rel_year_1", "rel_year_2", "rel_year_3", "rel_year_4", "rel_year_5")
+
+run_ES_DiD <- function(...) {
+  
+  data <- make_data()
+  data <- make_data()
+  data <- data %>% 
+    mutate(rel_year = year - cohort_year) %>% 
+    dummy_cols(select_columns = "rel_year") %>% 
+    mutate(Pre = ifelse(rel_year < -5, 1, 0),
+           Post = ifelse(rel_year > 5, 1, 0))
+  mod <- lfe::felm(dep_var ~ Pre + `rel_year_-5` + `rel_year_-4` + `rel_year_-3` + `rel_year_-2` + 
+                `rel_year_0` + `rel_year_1` + `rel_year_2` + `rel_year_3` + `rel_year_4` + 
+                `rel_year_5` + Post | unit + year | 0 | state, data = data, exactDOF = TRUE)
+  mod2 <- tibble(
+    estimate = mod$coefficients,
+    term1 = rownames(mod$coefficients)
+    )
+  
+ es <-
+   mod2 %>% 
+    filter(term1 %in% keepvars) %>% 
+    mutate(t = c(-5:-2, 0:5)) %>% 
+    select(t, estimate)
+ es
+}
+
+data_classical <- map_dfr(1:nrep, run_ES_DiD)
+
+colors <- c("True Effect" = "red", "Estimated Effect" = "blue")
+
+ES_plot_classical <- data_classical %>% 
+  group_by(t) %>% 
+  summarize(avg = mean(estimate),
+            sd = sd(estimate),
+            lower.ci = avg - 1.96*sd,
+            upper.ci = avg + 1.96*sd) %>% 
+  bind_rows(tibble(t = -1, avg = 0, sd = 0, lower.ci = 0, upper.ci = 0)) %>% 
+  mutate(true_tau = ifelse(t >= 0, (t + 1)* true_mu, 0)) %>% 
+  ggplot(aes(x = t, y = avg)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci), color = "lightgrey", alpha = 0.2) +
+  geom_point(color = 'blue', size = 3) + 
+  geom_line(aes(color = 'Estimated Effect'), size = 1) + 
+  geom_line(aes(x = t, y = true_tau, color = 'True Effect'), linetype = "dashed", size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_x_continuous(breaks = -5:5) + 
+  labs(x = "Relative Time", y = "Estimate") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12)) +
+  ggtitle("TWFE event-study regression with binned end-points")+
+  scale_color_manual(values = colors) + 
+  theme(plot.title = element_text(hjust = 0.5, size=12),
+        legend.position = "bottom", 
+        legend.title = element_blank())
+
+ES_plot_classical
+
+```
+```{r message=FALSE,results='hide',fig.show='hide'}
+run_ES_DiD_sat <- function(...) {
+  data <- make_data()
+  data <- data %>% 
+    mutate(rel_year = year - cohort_year)
+  min_year <- min(data$rel_year)
+  data <- data %>% 
+    mutate(rel_year = rel_year - min_year) %>% 
+    dummy_cols(select_columns = "rel_year")
+  indics <- paste("rel_year", (1:max(data$rel_year))[-(-1 - min_year)], sep = "_", collapse = " + ")
+  keepvars <- paste("rel_year", c(-5:-2, 0:5) - min_year, sep = "_")  
+  formula <- as.formula(paste("dep_var ~", indics, "| unit + year | 0 | state"))
+  mod <- felm(formula, data = data, exactDOF = TRUE)
+  mod2 <- tibble(
+    estimate = mod$coefficients,
+    term1 = rownames(mod$coefficients)
+    )
+  
+ es <-
+   mod2 %>% 
+    filter(term1 %in% keepvars) %>% 
+    mutate(t = c(-5:-2, 0:5)) %>% 
+    select(t, estimate)
+ es
+}
+
+data_sat <- map_dfr(1:nrep, run_ES_DiD_sat)
+
+ES_plot_sat <- data_sat %>% 
+  group_by(t) %>% 
+  summarize(avg = mean(estimate),
+            sd = sd(estimate),
+            lower.ci = avg - 1.96*sd,
+            upper.ci = avg + 1.96*sd) %>% 
+  bind_rows(tibble(t = -1, avg = 0, sd = 0, lower.ci = 0, upper.ci = 0)) %>% 
+  mutate(true_tau = ifelse(t >= 0, (t + 1)* true_mu, 0)) %>% 
+  ggplot(aes(x = t, y = avg)) + 
+ geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci), color = "lightgrey", alpha = 0.2) +
+  geom_point(color = 'blue', size = 3) + 
+   geom_line(aes(color = 'Estimated Effect'), size = 1) + 
+   geom_line(aes(x = t, y = true_tau, color = 'True Effect'), linetype = "dashed", size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_x_continuous(breaks = -5:5) + 
+  labs(x = "Relative Time", y = "Estimate") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12)) +
+  ggtitle("TWFE event-study regression with 'all' leads and lags")+
+  scale_color_manual(values = colors) + 
+  theme(plot.title = element_text(hjust = 0.5, size=12),
+        legend.position = "bottom", 
+        legend.title = element_blank())
+    
+ES_plot_sat
+```
+Using the Callaway and Sant’Anna (2021) framework
+```{r message=FALSE,results='hide',fig.show='hide'}
+run_CS <- function(...) {
+  data <- make_data()
+  mod <- did::att_gt(yname = "dep_var", 
+                     tname = "year",
+                     idname = "unit",
+                     gname = "cohort_year",
+                     control_group= "notyettreated",
+                     bstrap = FALSE,
+                     data = data,
+                     print_details = FALSE)
+  event_std <- did::aggte(mod, type = "dynamic")
+  
+  att.egt <- event_std$att.egt
+  names(att.egt) <- event_std$egt
+
+  broom::tidy(att.egt) %>% 
+    filter(names %in% -5:5) %>% 
+    mutate(t = -5:5, estimate = x) %>% 
+    select(t, estimate)
+}
+
+data_CS <- map_dfr(1:nrep, run_CS)
+
+ES_plot_CS <- data_CS %>% 
+  group_by(t) %>% 
+  summarize(avg = mean(estimate),
+            sd = sd(estimate),
+            lower.ci = avg - 1.96*sd,
+            upper.ci = avg + 1.96*sd) %>% 
+  mutate(true_tau = ifelse(t >= 0, (t + 1)* true_mu, 0)) %>% 
+  ggplot(aes(x = t, y = avg)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci), color = "lightgrey", alpha = 0.2) +
+  geom_point(color = 'blue', size = 3) + 
+   geom_line(aes(color = 'Estimated Effect'), size = 1) + 
+   geom_line(aes(x = t, y = true_tau, color = 'True Effect'), linetype = "dashed", size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_x_continuous(breaks = -5:5) + 
+  labs(x = "Relative Time", y = "Estimate") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12)) +
+  ggtitle("Event-study-parameters estimated using Callaway and Sant'Anna (2021)\nComparison group: Not-yet-treated")+
+    scale_color_manual(values = colors) + 
+  theme(plot.title = element_text(hjust = 0.5, size=12),
+        legend.position = "bottom", 
+        legend.title = element_blank())
+
+ES_plot_CS
+```
+
+#### Setup with a group that remains untreated at the end of the sampl
+Visualizing the DGP
+```{r message=FALSE,results='hide',fig.show='hide'}
+make_data2 <- function(nobs = 1000, 
+                      nstates = 40) {
+  unit <- tibble(
+    unit = 1:nobs,
+    state = sample(1:nstates, nobs, replace = TRUE),
+    unit_fe = rnorm(nobs, state/5, 1),
+    mu = true_mu
+  )
+  
+  year <- tibble(
+    year = 1980:2010,
+    year_fe = rnorm(length(year), 0, 1)
+  )
+  
+  treat_taus <- tibble(
+    state = sample(1:nstates, nstates, replace = FALSE),
+    cohort_year = sort(rep(c(1986, 1992, 1998, 2004), 10))
+  )
+  
+  expand_grid(unit = 1:nobs, year = 1980:2010) %>% 
+    left_join(., unit) %>% 
+    left_join(., year) %>% 
+    left_join(., treat_taus) %>% 
+    mutate(error = rnorm(nobs*31, 0, 1),
+           treat = ifelse((year >= cohort_year)* (cohort_year != 2004), 1, 0),
+           tau = ifelse(treat == 1, mu, 0),
+           year_fe = year_fe + 0.1*(year - cohort_year)
+    ) %>% 
+    group_by(unit) %>% 
+    mutate(tau_cum = cumsum(tau)) %>% 
+    ungroup() %>% 
+    mutate(dep_var = (2010 - cohort_year) + unit_fe + year_fe + tau_cum + error) %>%
+    mutate(cohort_year = ifelse(cohort_year == 2004, Inf, cohort_year))
+  
+}
+
+data <- make_data2()
+plot2 <- data %>% 
+  ggplot(aes(x = year, y = dep_var, group = unit)) + 
+  geom_line(alpha = 1/8, color = "grey") + 
+  geom_line(data = data %>% 
+              group_by(cohort_year, year) %>% 
+              summarize(dep_var = mean(dep_var)),
+            aes(x = year, y = dep_var, group = factor(cohort_year),
+                color = factor(cohort_year)),
+            size = 2) + 
+  labs(x = "", y = "Value",  color = "Treatment group   ") + 
+  geom_vline(xintercept = 1986, color = '#E41A1C', size = 2) + 
+  geom_vline(xintercept = 1992, color = '#377EB8', size = 2) + 
+  geom_vline(xintercept = 1998, color = '#4DAF4A', size = 2) + 
+  scale_color_brewer(palette = 'Set1') + 
+  theme(legend.position = 'bottom',
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12)) +
+  scale_color_manual(labels = c("1986", "1992", "1998", "Never-treated"),
+                     values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3"))+
+  ggtitle("One draw of the DGP with homogeneous effects across cohorts \n and with a never-treated group")+
+  theme(plot.title = element_text(hjust = 0.5, size=12))
+
+plot2 
+```
+Estimating dynamic treatment effects via TWFE event-study regressions
+```{r message=FALSE,results='hide',fig.show='hide'}
+keepvars <- c("`rel_year_-5`",  "`rel_year_-4`",  "`rel_year_-3`",  "`rel_year_-2`",
+              "rel_year_0", "rel_year_1", "rel_year_2", "rel_year_3", "rel_year_4", "rel_year_5")
+
+run_ES_DiD_never <- function(...) {
+  
+  data <- make_data2()
+  data <- data %>% 
+    mutate(rel_year = year - cohort_year) %>% 
+    mutate(rel_year = ifelse(rel_year == -Inf, NA, rel_year))%>% 
+    dummy_cols(select_columns = "rel_year") %>% 
+    mutate(across(starts_with("rel_year_"), ~replace_na(., 0))) %>% 
+    mutate(Pre = ifelse((rel_year < -5) * (!is.na(rel_year)), 1, 0),
+           Post = ifelse((rel_year > 5) * (!is.na(rel_year)), 1, 0)) %>%
+    mutate(Pre = ifelse(is.na(Pre), 0, Pre),
+           Post = ifelse(is.na(Post), 0, Post))
+  
+  mod <- lfe::felm(dep_var ~ Pre + `rel_year_-5` + `rel_year_-4` + `rel_year_-3` + `rel_year_-2` + 
+                `rel_year_0` + `rel_year_1` + `rel_year_2` + `rel_year_3` + `rel_year_4` + 
+                `rel_year_5` + Post | unit + year | 0 | state, data = data, exactDOF = TRUE)
+  # grab the obs we need
+  mod2 <- tibble(
+    estimate = mod$coefficients,
+    term1 = rownames(mod$coefficients)
+    )
+ es <-
+   mod2 %>% 
+    filter(term1 %in% keepvars) %>% 
+    mutate(t = c(-5:-2, 0:5)) %>% 
+    select(t, estimate)
+ es
+}
+
+data_classical_never <- map_dfr(1:nrep, run_ES_DiD_never)
+
+ES_plot_classical_never <- data_classical_never %>% 
+  group_by(t) %>% 
+  summarize(avg = mean(estimate),
+            sd = sd(estimate),
+            lower.ci = avg - 1.96*sd,
+            upper.ci = avg + 1.96*sd) %>% 
+  bind_rows(tibble(t = -1, avg = 0, sd = 0, lower.ci = 0, upper.ci = 0)) %>% 
+  mutate(true_tau = ifelse(t >= 0, (t + 1)* true_mu, 0)) %>% 
+  ggplot(aes(x = t, y = avg)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci), color = "lightgrey", alpha = 0.2) +
+  geom_point(color = 'blue', size = 3) + 
+   geom_line(aes(color = 'Estimated Effect'), size = 1) + 
+   geom_line(aes(x = t, y = true_tau, color = 'True Effect'), linetype = "dashed", size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_x_continuous(breaks = -5:5) + 
+  labs(x = "Relative Time", y = "Estimate") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))+
+  ggtitle("TWFE event-study regression with binned end-points")+
+    scale_color_manual(values = colors) + 
+  theme(plot.title = element_text(hjust = 0.5, size=12),
+        legend.position = "bottom", 
+        legend.title = element_blank())
+
+ES_plot_classical_never
+```
+```{r message=FALSE,results='hide',fig.show='hide'}
+run_ES_DiD_sat_never <- function(...) {
+
+  data <- make_data2()
+  data <- data %>% 
+    mutate(rel_year = year - cohort_year)
+  
+  # get the minimum relative year - we need this to reindex
+  min_year <- min(data$rel_year * (data$rel_year != -Inf), na.rm = T)
+  
+  data <- data %>% 
+    mutate(rel_year2 = rel_year) %>% 
+    mutate(rel_year = rel_year - min_year) %>% 
+    dummy_cols(select_columns = "rel_year") %>% 
+    select(-("rel_year_-Inf"))
+    # make regression formula 
+  indics <- paste("rel_year", (1:max(data$rel_year))[-(-1 - min_year)], sep = "_", collapse = " + ")
+  keepvars <- paste("rel_year", c(-5:-2, 0:5) - min_year, sep = "_")  
+  formula <- as.formula(paste("dep_var ~", indics, "| unit + year | 0 | state"))
+  
+  mod <- felm(formula, data = data, exactDOF = TRUE)
+  
+ # grab the obs we need
+  mod2 <- tibble(
+    estimate = mod$coefficients,
+    term1 = rownames(mod$coefficients)
+    )
+  
+ es <-
+   mod2 %>% 
+    filter(term1 %in% keepvars) %>% 
+    mutate(t = c(-5:-2, 0:5)) %>% 
+    select(t, estimate)
+ es
+}
+
+data_sat_never <- map_dfr(1:nrep, run_ES_DiD_sat_never)
+
+ES_plot_sat_never <- data_sat_never %>% 
+  group_by(t) %>% 
+  summarize(avg = mean(estimate),
+            sd = sd(estimate),
+            lower.ci = avg - 1.96*sd,
+            upper.ci = avg + 1.96*sd) %>% 
+  bind_rows(tibble(t = -1, avg = 0, sd = 0, lower.ci = 0, upper.ci = 0)) %>% 
+  mutate(true_tau = ifelse(t >= 0, (t + 1)* true_mu, 0)) %>% 
+  ggplot(aes(x = t, y = avg)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci), color = "lightgrey", alpha = 0.2) +
+  geom_point(color = 'blue', size = 3) + 
+   geom_line(aes(color = 'Estimated Effect'), size = 1) + 
+   geom_line(aes(x = t, y = true_tau, color = 'True Effect'), linetype = "dashed", size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_x_continuous(breaks = -5:5) + 
+  labs(x = "Relative Time", y = "Estimate") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))+
+  ggtitle("TWFE event-study regression with 'all' leads and lags")+
+  scale_color_manual(values = colors) + 
+  theme(plot.title = element_text(hjust = 0.5, size=12),
+        legend.position = "bottom", 
+        legend.title = element_blank())
+
+ES_plot_sat_never
+```
+Using the Callaway and Sant’Anna (202) framework
+```{r message=FALSE,results='hide',fig.show='hide'}
+run_CS_ny <- function(...) {
+  data$cohort_year[data$cohort_year==Inf] <- 0
+  mod <- did::att_gt(yname = "dep_var", 
+                     tname = "year",
+                     idname = "unit",
+                     gname = "cohort_year",
+                     control_group= "notyettreated",
+                     bstrap = FALSE,
+                     data = data,
+                     print_details = FALSE)
+  event_std <- did::aggte(mod, type = "dynamic")
+  
+  att.egt <- event_std$att.egt
+  names(att.egt) <- event_std$egt
+  
+  # grab the obs we need
+  broom::tidy(att.egt) %>% 
+    filter(names %in% -5:5) %>% 
+    mutate(t = -5:5, estimate = x) %>% 
+    select(t, estimate)
+}
+
+data_CS_ny <- map_dfr(1:nrep, run_CS_ny)
+
+ES_plot_CS_ny <- data_CS_ny %>% 
+  group_by(t) %>% 
+  summarize(avg = mean(estimate),
+            sd = sd(estimate),
+            lower.ci = avg - 1.96*sd,
+            upper.ci = avg + 1.96*sd) %>% 
+  mutate(true_tau = ifelse(t >= 0, (t + 1)* true_mu, 0)) %>% 
+  ggplot(aes(x = t, y = avg)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci), color = "lightgrey", alpha = 0.2) +
+  geom_point(color = 'blue', size = 3) + 
+   geom_line(aes(color = 'Estimated Effect'), size = 1) + 
+   geom_line(aes(x = t, y = true_tau, color = 'True Effect'), linetype = "dashed", size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_x_continuous(breaks = -5:5) + 
+  labs(x = "Relative Time", y = "Estimate") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))+
+  ggtitle("Event-study-parameters estimated using Callaway and Sant'Anna (2021)\nComparison group: Not-yet-treated units")+
+  scale_color_manual(values = colors) + 
+  theme(plot.title = element_text(hjust = 0.5, size=12),
+        legend.position = "bottom", 
+        legend.title = element_blank())
+
+ES_plot_CS_ny
+```
+#### Setup with Heterogeneous Treatment Effects
+Visualizing the DGP
+```{r message=FALSE,results='hide',fig.show='hide'}
+make_data3 <- function(nobs = 1000, 
+                      nstates = 40) {
+  unit <- tibble(
+    unit = 1:nobs,
+    state = sample(1:nstates, nobs, replace = TRUE),
+    unit_fe = rnorm(nobs, state/5, 1),
+    mu = true_mu
+  )
+  
+  # year fixed effects (first part)
+  year <- tibble(
+    year = 1980:2010,
+    year_fe = rnorm(length(year), 0, 1)
+  )
+  
+  treat_taus <- tibble(
+    state = sample(1:nstates, nstates, replace = FALSE),
+      # place the randomly sampled states into 1\{t \ge g \}G_g
+    cohort_year = sort(rep(c(1986, 1992, 1998, 2004), 10))
+  )
+  
+  # full interaction of unit X year 
+  expand_grid(unit = 1:nobs, year = 1980:2010) %>% 
+    left_join(., unit) %>% 
+    left_join(., year) %>% 
+    left_join(., treat_taus) %>% 
+    # make error term and get treatment indicators and treatment effects
+    # Also get cohort specific trends (modify time FE)
+    mutate(error = rnorm(nobs*31, 0, 1),
+           treat = ifelse((year >= cohort_year)* (cohort_year != 2004), 1, 0),
+           mu = ifelse(cohort_year==1992, 2, ifelse(cohort_year==1998, 1, 3)),
+           tau = ifelse(treat == 1, mu, 0),
+           year_fe = year_fe + 0.1*(year - cohort_year)
+    ) %>% 
+    # calculate cumulative treatment effects
+    group_by(unit) %>% 
+    mutate(tau_cum = cumsum(tau)) %>% 
+    ungroup() %>% 
+    # calculate the dep variable
+    mutate(dep_var = (2010 - cohort_year) + unit_fe + year_fe + tau_cum + error) %>%
+    # Relabel 2004 cohort as never-treated
+    mutate(cohort_year = ifelse(cohort_year == 2004, Inf, cohort_year))
+  
+}
+
+data <- make_data3()
+plot3 <- data %>% 
+  ggplot(aes(x = year, y = dep_var, group = unit)) + 
+  geom_line(alpha = 1/8, color = "grey") + 
+  geom_line(data = data %>% 
+              group_by(cohort_year, year) %>% 
+              summarize(dep_var = mean(dep_var)),
+            aes(x = year, y = dep_var, group = factor(cohort_year),
+                color = factor(cohort_year)),
+            size = 2) + 
+  labs(x = "", y = "Value",  color = "Treatment group   ") + 
+  geom_vline(xintercept = 1986, color = '#E41A1C', size = 2) + 
+  geom_vline(xintercept = 1992, color = '#377EB8', size = 2) + 
+  geom_vline(xintercept = 1998, color = '#4DAF4A', size = 2) + 
+  scale_color_brewer(palette = 'Set1') + 
+  theme(legend.position = 'bottom',
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12)) +
+  scale_color_manual(labels = c("1986", "1992", "1998", "Never-treated"),
+                     values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3")) +
+  ggtitle("One draw of the DGP with heterogeneous treatment effect dynamics across cohorts \n and with a never-treated group")+
+  theme(plot.title = element_text(hjust = 0.5, size=12))
+
+plot3 
+```
+Estimating dynamic treatment effects via TWFE event-study regressions
+```{r message=FALSE,results='hide',fig.show='hide'}
+keepvars <- c("`rel_year_-5`",  "`rel_year_-4`",  "`rel_year_-3`",  "`rel_year_-2`",
+              "rel_year_0", "rel_year_1", "rel_year_2", "rel_year_3", "rel_year_4", "rel_year_5")
+
+run_ES_DiD_never_het <- function(...) {
+  data <- make_data3()
+  data <- data %>% 
+    mutate(rel_year = year - cohort_year) %>% 
+    mutate(rel_year = ifelse(rel_year == -Inf, NA, rel_year))%>% 
+    dummy_cols(select_columns = "rel_year") %>% 
+    mutate(across(starts_with("rel_year_"), ~replace_na(., 0))) %>% 
+    # generate pre and post dummies
+    mutate(Pre = ifelse((rel_year < -5) * (!is.na(rel_year)), 1, 0),
+           Post = ifelse((rel_year > 5) * (!is.na(rel_year)), 1, 0)) %>%
+    mutate(Pre = ifelse(is.na(Pre), 0, Pre),
+           Post = ifelse(is.na(Post), 0, Post))
+
+  mod <- lfe::felm(dep_var ~ Pre + `rel_year_-5` + `rel_year_-4` + `rel_year_-3` + `rel_year_-2` + 
+                `rel_year_0` + `rel_year_1` + `rel_year_2` + `rel_year_3` + `rel_year_4` + 
+                `rel_year_5` + Post | unit + year | 0 | state, data = data, exactDOF = TRUE)
+
+# grab the obs we need
+  mod2 <- tibble(
+    estimate = mod$coefficients,
+    term1 = rownames(mod$coefficients)
+    )
+  
+ es <-
+   mod2 %>% 
+    filter(term1 %in% keepvars) %>% 
+    mutate(t = c(-5:-2, 0:5)) %>% 
+    select(t, estimate)
+ es
+}
+
+data_classical_never_het <- map_dfr(1:nrep, run_ES_DiD_never_het)
+
+ES_plot_classical_never_het <- data_classical_never_het %>% 
+  group_by(t) %>% 
+  summarize(avg = mean(estimate),
+            sd = sd(estimate),
+            lower.ci = avg - 1.96*sd,
+            upper.ci = avg + 1.96*sd) %>% 
+  bind_rows(tibble(t = -1, avg = 0, sd = 0, lower.ci = 0, upper.ci = 0)) %>% 
+  mutate(true_tau = ifelse(t >= 0, (t + 1)* 2, 0)) %>% 
+  ggplot(aes(x = t, y = avg)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci), color = "lightgrey", alpha = 0.2) +
+  geom_point(color = 'blue', size = 3) + 
+   geom_line(aes(color = 'Estimated Effect'), size = 1) + 
+   geom_line(aes(x = t, y = true_tau, color = 'True Effect'), linetype = "dashed", size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_x_continuous(breaks = -5:5) + 
+  labs(x = "Relative Time", y = "Estimate") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))+
+  ggtitle("TWFE event-study regression with binned end-points")+
+  scale_color_manual(values = colors) + 
+  theme(plot.title = element_text(hjust = 0.5, size=12),
+        legend.position = "bottom", 
+        legend.title = element_blank())
+
+ES_plot_classical_never_het
+
+```
+
+```{r message=FALSE,results='hide',fig.show='hide'}
+run_ES_DiD_sat_never_het <- function(...) {
+  
+  data <- make_data3()
+  data <- data %>% 
+    mutate(rel_year = year - cohort_year)
+  
+  # get the minimum relative year - we need this to reindex
+  min_year <- min(data$rel_year * (data$rel_year != -Inf), na.rm = T)
+  
+  # reindex the relative years
+  data <- data %>% 
+    mutate(rel_year2 = rel_year) %>% 
+    mutate(rel_year = rel_year - min_year) %>% 
+    dummy_cols(select_columns = "rel_year") %>% 
+    select(-("rel_year_-Inf"))
+    
+  indics <- paste("rel_year", (1:max(data$rel_year))[-(-1 - min_year)], sep = "_", collapse = " + ")
+  keepvars <- paste("rel_year", c(-5:-2, 0:5) - min_year, sep = "_")  
+  formula <- as.formula(paste("dep_var ~", indics, "| unit + year | 0 | state"))
+
+  mod <- felm(formula, data = data, exactDOF = TRUE)
+# grab the obs we need
+  mod2 <- tibble(
+    estimate = mod$coefficients,
+    term1 = rownames(mod$coefficients)
+    )
+  
+ es <-
+   mod2 %>% 
+    filter(term1 %in% keepvars) %>% 
+    mutate(t = c(-5:-2, 0:5)) %>% 
+    select(t, estimate)
+ es
+}
+
+data_sat_never_het <- map_dfr(1:nrep, run_ES_DiD_sat_never_het)
+
+ES_plot_sat_never_het <- data_sat_never_het %>% 
+  group_by(t) %>% 
+  summarize(avg = mean(estimate),
+            sd = sd(estimate),
+            lower.ci = avg - 1.96*sd,
+            upper.ci = avg + 1.96*sd) %>% 
+  bind_rows(tibble(t = -1, avg = 0, sd = 0, lower.ci = 0, upper.ci = 0)) %>% 
+  mutate(true_tau = ifelse(t >= 0, (t + 1)* 2, 0)) %>% 
+  ggplot(aes(x = t, y = avg)) + 
+  geom_ribbon(aes(ymin = lower.ci, ymax = upper.ci), color = "lightgrey", alpha = 0.2) +
+  geom_point(color = 'blue', size = 3) + 
+   geom_line(aes(color = 'Estimated Effect'), size = 1) + 
+   geom_line(aes(x = t, y = true_tau, color = 'True Effect'), linetype = "dashed", size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  scale_x_continuous(breaks = -5:5) + 
+  labs(x = "Relative Time", y = "Estimate") + 
+  theme(axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))+
+  ggtitle("TWFE event-study regression with 'all' leads and lags")+
+  scale_color_manual(values = colors) + 
+  theme(plot.title = element_text(hjust = 0.5, size=12),
+        legend.position = "bottom", 
+        legend.title = element_blank())
+
+ES_plot_sat_never_het
+```
+
+# Pre-Testing in a DiD Setup using the did Package
+
+```{r message=FALSE,results='hide',fig.show='hide'}
+head(dta)
+Dtl <- sapply(-(time.periods-1):(time.periods-2), function(l) {
+    dtl <- 1*( (dta$period == dta$G + l) & (dta$G > 0) )
+    dtl
+})
+Dtl <- as.data.frame(Dtl)
+cnames1 <- paste0("Dtmin",(time.periods-1):1)
+colnames(Dtl) <- c(cnames1, paste0("Dt",0:(time.periods-2)))
+
+
+data <- cbind.data.frame(dta, Dtl)
+row.names(data) <- NULL
+head(data)
+
+library(plm)
+
+es <- plm(Y ~ Dtmin3 + Dtmin2 + Dt0 + Dt1 + Dt2, 
+          data=data, model="within", effect="twoways",
+          index=c("id","period"))
+
+summary(es)
+
+coefs1 <- coef(es)
+ses1 <- sqrt(diag(summary(es)$vcov))
+idx.pre <- 1:(time.periods-2)
+idx.post <- (time.periods-1):length(coefs1)
+coefs <- c(coefs1[idx.pre], 0, coefs1[idx.post])
+ses <- c(ses1[idx.pre], 0, ses1[idx.post])
+exposure <- -(time.periods-1):(time.periods-2)
+
+cmat <- data.frame(coefs=coefs, ses=ses, exposure=exposure)
+
+library(ggplot2)
+
+ggplot(data=cmat, mapping=aes(y=coefs, x=exposure)) +
+  geom_line(linetype="dashed") +
+  geom_point() + 
+  geom_errorbar(aes(ymin=(coefs-1.96*ses), ymax=(coefs+1.96*ses)), width=0.2) +
+  ylim(c(-2,5)) +
+  theme_bw()
+```
+
+```{r message=FALSE,results='hide',fig.show='hide'}
+did_att_gt <- att_gt(yname="Y",
+                     tname="period",
+                     idname="id",
+                     gname="G",
+                     data=data,
+                     bstrap=FALSE,
+                     cband=FALSE)
+summary(did_att_gt)
+ggdid(did_att_gt)
+
+did_es <- aggte(did_att_gt, type="dynamic")
+ggdid(did_es)
+```
+
+
+I can't solve code  problems in Pitfall: Selective Treatment Timing.The result is same with when without- selective is.
+
+#### Conditional Moment Tests
+
+# Writing Extensions to the did Package
+#### DiD with Anticipation
+Computing Treatment Effects under DiD with Anticipatio
+```{r message=FALSE,results='hide',fig.show='hide'}
+time.periods <- 5
+st<-reset.sim()
+st$te <- 0
+st$te.e <- c(-1,rep(1,time.periods-1))
+st$bett <-st$betu <- rep(0,time.periods)
+set.seed(12345)
+dta <- build_sim_dataset(st)
+dta$G <- ifelse(dta$G==0, 0, dta$G+1)
+dta$G <- ifelse(dta$G==6, 0, dta$G)
+nrow(dta)
+head(dta)
+```
+
+```{r message=FALSE,results='hide',fig.show='hide'}
+attgt.ignoredip <- att_gt(yname = "Y",
+                          tname = "period",
+                          idname = "id",
+                          gname = "G",
+                          xformla = ~1,
+                          data = dta,
+                          )
+summary(attgt.ignoredip)
+p <- ggdid(aggte(attgt.ignoredip, "dynamic"))
+library(ggplot2)
+truth <- cbind.data.frame(e = seq(-3,2), att.e = c(0,0,-1,1,1,1))
+p <- p + geom_line(data = truth, aes(x = e, y = att.e), inherit.aes = FALSE, color = "blue")
+p <- p + geom_point(data = truth, aes(x = e, y = att.e), inherit.aes = FALSE, color = "blue")
+p
+```
+
+```{r message=FALSE,results='hide',fig.show='hide'}
+compute.attgt <- function(dta) {
+  groups <- unique(dta$G)
+  time.periods <- unique(dta$period)
+  groups <- sort(groups)[-1]
+  time.periods <- sort(time.periods)[-c(1,2)]
+  time.periods <- time.periods[-length(time.periods)]
+  attgt.list <- list()
+  counter <- 1
+
+  for (g in groups) {
+    main.base.period <- g - 2
+    
+    for (tp in time.periods) {
+      if (tp < g) {
+        base.period <- tp - 2
+      } else {
+        base.period <- main.base.period
+      }
+      this.data <- subset(dta, G==g | G==0)
+
+      this.data <- subset(this.data, period==tp | period==base.period)
+      Ypost <- subset(this.data, period==tp)$Y
+      Ypre <- subset(this.data, period==base.period)$Y
+
+      G <- 1*(subset(this.data, period==tp)$G == g)
+      attgt <- DRDID::reg_did_panel(Ypost, Ypre, G, covariates=NULL)$ATT
+      attgt.list[[counter]] <- list(att=attgt, group=g, time.period=tp)
+      counter <- counter+1
+    }
+  }
+
+  attgt.results <- do.call("rbind.data.frame", attgt.list)
+  attgt.results$e <- attgt.results$time.period - attgt.results$group
+  # (will be used as weights)
+  n.group <- sapply(groups, function(gg) nrow(subset(dta, G==gg)))
+  ngroup.mat <- cbind(groups, n.group)
+  attgt.results <- merge(attgt.results, ngroup.mat, by.x = "group", by.y = "groups")
+  eseq <- unique(attgt.results$e) 
+  eseq <- sort(eseq)
+  att.e <- c()
+  counter <- 1
+  for (this.e in eseq) {
+    res.e <- subset(attgt.results, e==this.e)
+    res.e$weight <- res.e$n.group / sum(res.e$n.group)
+    att.e[counter] <- sum(res.e$att * res.e$weight)
+    counter <- counter+1
+  }
+  dyn.results <- cbind.data.frame(e = eseq, att.e = att.e)
+  return(list(attgt.results=attgt.results[,c("group","att","time.period")],
+              dyn.results=dyn.results))
+}
+```
+
+```{r message=FALSE,results='hide',fig.show='hide'}
+anticipation.results <- compute.attgt(dta)
+anticipation.results
+```
+Frankly,because of  simulated data, I can't deal with the code "BMisc::blockBootSample(dta, "id")"  about nonparametric bootstrap in the final act.
