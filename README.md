@@ -15,4 +15,4 @@ We conduct causal inference under unconfoundedness by using the cross-sectional 
 We use the ivmte package for understanding the marginal treatment effect (MTE) analysis developed by Mogstad, Santos, and Torgovitsky (2018). 
 
 ## Assignment 3
-Understand the difference-in-differences analysis with multiple time periods.
+Understand the difference-in-differences (DID) analysis with multiple time periods.
