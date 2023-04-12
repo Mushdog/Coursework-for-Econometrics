@@ -1,5 +1,6 @@
 # Coursework-for-Econometrics
- Conduct Causal Inference Using Some Parametric Econometric Models with R Codes.
+ Conduct Causal Inference Using Some Parametric Econometric Models with R Codes. The README cites the course professor's introduction to the assignment.
+
 ## Assignment 1
 We conduct causal inference under unconfoundedness by using the cross-sectional data lalonde included in the R package Matching. 
 
